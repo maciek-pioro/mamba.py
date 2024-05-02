@@ -2,6 +2,8 @@ import math
 from dataclasses import dataclass
 from typing import Union
 
+from numpy import stack
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -75,6 +77,20 @@ class Mamba(nn.Module):
             x = layer(x)
 
         return x
+
+    def forward_with_caches(self, x, requested_caches: list[int]):
+        # x : (B, L, D)
+
+        # y : (B, L, D)
+
+        # requested_caches : (B) (tells us the last token in each sequence, i.e. the one for which we want the cache)
+
+        caches = [None] * len(self.layers) 
+
+        for i, layer in enumerate(self.layers):
+            x, caches[i] = layer.forward_with_caches(x, requested_caches)
+
+        return x, caches
     
     def step(self, x, caches):
         # x : (B, L, D)
@@ -102,6 +118,18 @@ class ResidualBlock(nn.Module):
 
         output = self.mixer(self.norm(x)) + x
         return output
+    
+    def forward_with_caches(self, x, requested_caches: list[int]):
+        # x : (B, L, D)
+
+        # output : (B, L, D)
+
+        # requested_caches : (B) (tells us the last token in each sequence, i.e. the one for which we want the cache)
+
+
+        output, caches = self.mixer.forward_with_caches(self.norm(x), requested_caches)
+        return output + x, caches
+    
     
     def step(self, x, cache):
         # x : (B, D)
@@ -224,6 +252,72 @@ class MambaBlock(nn.Module):
 
         return output
     
+    def forward_with_caches(self, x, requested_caches: list[int]):
+        # x : (B, L, D)
+        
+        # y : (B, L, D)
+
+        # requested_caches : (B) (tells us the last token in each sequence, i.e. the one for which we want the cache)
+
+        _, L, _ = x.shape
+
+        xz = self.in_proj(x) # (B, L, 2*ED)
+        x, z = xz.chunk(2, dim=-1) # (B, L, ED), (B, L, ED)
+
+        # x branch
+        x = x.transpose(1, 2) # (B, ED, L)
+        padded_sequence = F.pad(
+            x, (self.config.d_conv - 2, 0), mode='constant', value=0
+        ).transpose(1, 2)
+        # req cache = 1 -> [0, 0, input[0]] -> (pad = dconv - 2) -> [0, 0, padded_input[2 (req - 1 + d_conv - 2)]]
+        # assert self.config.d_conv == 4
+        stacked_conv_caches = []
+        for b, request in enumerate(requested_caches):
+            assert request >= 1
+            conv_cache = padded_sequence[b:b+1, (request-1):(request + self.config.d_conv - 2), :]
+            stacked_conv_caches.append(conv_cache)
+        stacked_conv_caches = torch.cat(stacked_conv_caches, dim=0).transpose(1, 2)
+        x = self.conv1d(x)[:, :, :L] # depthwise convolution over time, with a short filter
+        x = x.transpose(1, 2) # (B, L, ED)
+
+        x = F.silu(x)
+        y, ssm_caches = self.ssm_with_caches(x, requested_caches=requested_caches)
+
+        # if self.config.use_cuda:
+        #     output = self.out_proj(y) # (B, L, D)
+        #     return output
+
+        # z branch
+        z = F.silu(z)
+
+        output = y * z
+        output = self.out_proj(output) # (B, L, D)
+
+        return output, (ssm_caches, stacked_conv_caches)
+    
+
+    def ssm_with_caches(self, x, requested_caches: list[int]):
+        # x : (B, L, ED)
+
+        # y : (B, L, ED)
+
+        A = -torch.exp(self.A_log.float()) # (ED, N)
+        D = self.D.float()
+
+        deltaBC = self.x_proj(x) # (B, L, dt_rank+2*N)
+        delta, B, C = torch.split(deltaBC, [self.config.dt_rank, self.config.d_state, self.config.d_state], dim=-1) # (B, L, dt_rank), (B, L, N), (B, L, N)
+        delta, B, C = self._apply_layernorms(delta, B, C)
+        delta = self.dt_proj.weight @ delta.transpose(1, 2) # (ED, dt_rank) @ (B, L, dt_rank) -> (B, ED, L)
+        # here we just apply the matrix mul operation of delta = softplus(dt_proj(delta))
+        # the rest will be applied later (fused if using cuda)
+    
+        delta = delta.transpose(1, 2)
+        delta = F.softplus(delta + self.dt_proj.bias)
+
+        y, caches = self.selective_scan_with_caches(x, delta, A, B, C, D, requested_caches=requested_caches)
+
+        return y, caches
+    
     def ssm(self, x, z):
         # x : (B, L, ED)
 
@@ -284,6 +378,35 @@ class MambaBlock(nn.Module):
         y = y + D * x
 
         return y
+
+    def selective_scan_with_caches(self, x, delta, A, B, C, D, requested_caches):
+        # x : (B, L, ED)
+        # Δ : (B, L, ED)
+        # A : (ED, N)
+        # B : (B, L, N)
+        # C : (B, L, N)
+        # D : (ED)
+
+        # y : (B, L, ED)
+
+        # print(delta.shape, A.shape)
+        deltaA = torch.exp(delta.unsqueeze(-1) * A) # (B, L, ED, N)
+        deltaB = delta.unsqueeze(-1) * B.unsqueeze(2) # (B, L, ED, N)
+
+        BX = deltaB * (x.unsqueeze(-1)) # (B, L, ED, N)
+        
+        hs = pscan(deltaA, BX)
+
+        y = (hs @ C.unsqueeze(-1)).squeeze(3) # (B, L, ED, N) @ (B, L, N, 1) -> (B, L, ED, 1)
+
+        y = y + D * x
+
+        # print(hs.shape)
+        # print(F.one_hot(torch.tensor(requested_caches, device=hs.device), num_classes=hs.size(1)).bool().shape)
+        caches = hs[F.one_hot(torch.tensor([r - 1 for r in requested_caches], device=hs.device), num_classes=hs.size(1)).bool()]
+        # print(caches.shape)
+
+        return y, caches
     
     def selective_scan_seq(self, x, delta, A, B, C, D):
         # x : (B, L, ED)
