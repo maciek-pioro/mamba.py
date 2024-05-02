@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from mamba import Mamba, MambaConfig, RMSNorm
+from safetensors.torch import load_file as load_file_safetensors
 
 """
 
@@ -64,17 +65,73 @@ def from_pretrained(name: str):
         return json.load(open(resolved_archive_file))
                 
     def load_state_dict_hf(model_name):
-        resolved_archive_file = cached_file(model_name, WEIGHTS_NAME, _raise_exceptions_for_missing_entries=False)
-        return torch.load(resolved_archive_file, weights_only=True, map_location='cpu', mmap=True)
+        if model_name.endswith('-hf') or model_name.endswith('-rw'):
+            resolved_archive_file = cached_file(model_name, "model.safetensors", _raise_exceptions_for_missing_entries=False)
+            print(resolved_archive_file)
+            return load_file_safetensors(resolved_archive_file, device='cpu') # torch.load(resolved_archive_file, weights_only=True, map_location='cpu', mmap=True)
+        else:
+            resolved_archive_file = cached_file(model_name, WEIGHTS_NAME, _raise_exceptions_for_missing_entries=False)
+            print(resolved_archive_file)
+            return torch.load(resolved_archive_file, weights_only=True, map_location='cpu', mmap=True)
         
     # copy config data
     config_data = load_config_hf(name)
-    config = MambaLMConfig(d_model=config_data['d_model'], n_layers=config_data['n_layer'], vocab_size=config_data['vocab_size'])
+    print(config_data)
+    # config = MambaLMConfig(d_model=config_data['d_model'], n_layers=config_data['n_layer'], vocab_size=config_data['vocab_size'])
+    config = MambaLMConfig(d_model=(config_data['hidden_size'] if 'hidden_size' in config_data.keys() else config_data['d_model']), n_layers=config_data['n_layer'], vocab_size=config_data['vocab_size'])
 
     model = MambaLM(config)
 
+    def replace(old_dict, new_dict, old_key, new_key):
+        new_dict[new_key] = old_dict[old_key]
+        del old_dict[old_key]
     # copy weights
     state_dict = load_state_dict_hf(name)
+    if name == "TRI-ML/mamba-7b-rw":
+        new_state_dict = {}
+        replace(state_dict, new_state_dict, 'embeddings.weight', 'backbone.embedding.weight')
+        for i in range(64):
+            for continuation in [
+                "mixer.A_log",
+                "mixer.conv1d.bias",
+                "mixer.conv1d.weight",
+                "mixer.D",
+                "mixer.dt_proj.bias",
+                "mixer.dt_proj.weight",
+                "mixer.in_proj.weight",
+                "mixer.out_proj.weight",
+                "mixer.x_proj.weight",
+                "norm.weight",
+            ]:
+                replace(state_dict, new_state_dict, f"layers.{i}.{continuation}", f"backbone.layers.{i}.{continuation}")
+        replace(state_dict, new_state_dict, 'norm_f.weight', 'backbone.norm_f.weight')
+        replace(state_dict, new_state_dict, 'model.lm_head.weight', 'lm_head.weight')
+        state_dict = new_state_dict
+
+
+    # print(sorted(state_dict.keys()))
+
+    # if 'backbone.embeddings.weight' in state_dict.keys():
+    #     state_dict['backbone.embedding.weight'] = state_dict['backbone.embeddings.weight']
+    #     del state_dict['backbone.embeddings.weight']
+    
+    # if "embeddings.weight" in state_dict.keys():
+    #     state_dict['backbone.embedding.weight'] = state_dict['embeddings.weight']
+    #     del state_dict['embeddings.weight']
+
+    # keys = list(state_dict.keys())
+    # for key in keys:
+    #     if key != 'model.lm_head.weight' and 'backbone' not in key:
+    #         state_dict[f"backbone.{key}"] = state_dict[key]
+    #         del state_dict[key]
+
+    # if "lm_head.weight" not in state_dict.keys():
+    #     if "model.lm_head.weight" in state_dict.keys():
+    #         state_dict["lm_head.weight"] = state_dict["model.lm_head.weight"]
+    #         del state_dict["model.lm_head.weight"]
+    #     else:
+    #         state_dict["lm_head.weight"] = state_dict["backbone.embedding.weight"]
+
 
     new_state_dict = {}
     for key in state_dict:
